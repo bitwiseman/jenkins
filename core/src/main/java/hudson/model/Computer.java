@@ -484,7 +484,12 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
      */
     public Future<?> disconnect(OfflineCause cause) {
         recordTermination();
+        this.disconnecting = true;
         offlineCause = cause;
+        synchronized(statusChangeLock) {
+            statusChangeLock.notifyAll();
+        }
+
         if (Util.isOverridden(Computer.class,getClass(),"disconnect"))
             return disconnect();    // legacy subtypes that extend disconnect().
 
@@ -717,8 +722,14 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
             statusChangeLock.notifyAll();
         }
         for (ComputerListener cl : ComputerListener.all()) {
-            if (temporarilyOffline)     cl.onTemporarilyOffline(this,cause);
-            else                        cl.onTemporarilyOnline(this);
+            try {
+                if (temporarilyOffline)     cl.onTemporarilyOffline(this,cause);
+                else                        cl.onTemporarilyOnline(this);
+            } catch (Exception e) {
+                LOGGER.log(LogLevel.WARNING,
+                    String.format("Exception in onTemporarilyOffline() for the computer listener %s on the Jenkins master node", cl.getClass()),
+                    e);
+            }
         }
     }
 

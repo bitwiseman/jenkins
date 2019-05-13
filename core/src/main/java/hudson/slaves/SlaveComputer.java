@@ -141,6 +141,12 @@ public class SlaveComputer extends Computer {
      */
     private volatile Future<?> lastConnectActivity = null;
 
+    /**
+     * Tracks the status of the last disconnect operation, which is always asynchronous.
+     * This sets the agent to offline while disconnnect is in progress.
+     */
+    private volatile Future<?> lastDisconnectActivity = null;
+
     private Object constructed = new Object();
 
     private transient volatile String absoluteRemoteFs;
@@ -277,13 +283,13 @@ public class SlaveComputer extends Computer {
         if(forceReconnect && isConnecting())
             logger.fine("Forcing a reconnect on "+getName());
 
-        closeChannel();
         return lastConnectActivity = Computer.threadPoolForRemoting.submit(new java.util.concurrent.Callable<Object>() {
             public Object call() throws Exception {
                 // do this on another thread so that the lengthy launch operation
                 // (which is typical) won't block UI thread.
 
                 ACL.impersonate(ACL.SYSTEM);    // background activity should run like a super user
+                closeChannel();
 
                 try {
                     log.rewind();
@@ -367,6 +373,14 @@ public class SlaveComputer extends Computer {
             ((ExecutorListener) r).taskCompletedWithProblems(executor, task, durationMS, problems);
         }
     }
+
+    @Exported
+    @Override
+    public boolean isOffline() {
+        Future<?> l = lastDisconnectActivity;
+        return base.isOffline() || l == null || !lastDisconnectActivity.isDone();
+    }
+
 
     @Override
     public boolean isConnecting() {
@@ -745,7 +759,8 @@ public class SlaveComputer extends Computer {
     @Override
     public Future<?> disconnect(OfflineCause cause) {
         super.disconnect(cause);
-        return Computer.threadPoolForRemoting.submit(new Runnable() {
+
+        return lastDisconnectActivity = Computer.threadPoolForRemoting.submit(new Runnable() {
             public void run() {
                 // do this on another thread so that any lengthy disconnect operation
                 // (which could be typical) won't block UI thread.
@@ -760,7 +775,7 @@ public class SlaveComputer extends Computer {
     @Override
     public void doLaunchSlaveAgent(StaplerRequest req, StaplerResponse rsp) throws IOException {
         checkPermission(CONNECT);
-            
+
         if(channel!=null) {
             try {
                 req.getView(this, "already-launched.jelly").forward(req, rsp);
@@ -833,20 +848,44 @@ public class SlaveComputer extends Computer {
     private void closeChannel() {
         // TODO: race condition between this and the setChannel method.
         Channel c;
+
+        // close the channel and notify status change
         synchronized (channelLock) {
             c = channel;
+            closing = true;
             channel = null;
             absoluteRemoteFs = null;
             isUnix = null;
+
+            if (c != null) {
+                synchronized (statusChangeLock) {
+                    statusChangeLock.notifyAll();
+                }
+            }
         }
+
         if (c != null) {
+            SecurityContext old = ACL.impersonate(ACL.SYSTEM);
+            try {
+                // call onOffline for listeners
+                for (ComputerListener cl : ComputerListener.all()) {
+                    try {
+                        cl.onOffline(this, channel, offlineCause);
+                    } catch (Exception e) {
+                        // Log exceptions but continue to execute other listeners
+                        LOGGER.log(WARNING,
+                            String.format("Exception in onOffline() for the computer listener %s on ... TODO", cl.getClass()),
+                            e);
+                    }
+                }
+            } finally {
+                SecurityContextHolder.setContext(old);
+            }
             try {
                 c.close();
             } catch (IOException e) {
                 logger.log(Level.SEVERE, "Failed to terminate channel to " + getDisplayName(), e);
             }
-            for (ComputerListener cl : ComputerListener.all())
-                cl.onOffline(this, offlineCause);
         }
     }
 
